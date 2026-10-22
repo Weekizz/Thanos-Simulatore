@@ -1,0 +1,557 @@
+-- LocalScript unique : StarterPlayer > StarterPlayerScripts
+-- Panel admin 100 % client, style Rayfield (onglets, switchs animés, sliders)
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+
+-- Pseudos autorisés (en minuscules)
+local ADMIN_NAMES = {
+	["kts_knigth"] = true,
+	["staybusyb"] = true,
+}
+if not ADMIN_NAMES[player.Name:lower()] then return end
+
+-- ================= FONCTIONS =================
+local flyOn, speedOn, farmOn = false, false, false
+local flySpeed, walkSpeed = 60, 50
+local flyConn, bv
+
+local function getChar()
+	local char = player.Character
+	return char, char and char:FindFirstChild("HumanoidRootPart"), char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function setFly(state)
+	flyOn = state
+	if flyConn then flyConn:Disconnect() flyConn = nil end
+	if bv then bv:Destroy() bv = nil end
+	local _, root, hum = getChar()
+	if not (root and hum) then return end
+	if state then
+		hum.PlatformStand = true
+		bv = Instance.new("BodyVelocity")
+		bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+		bv.Velocity = Vector3.zero
+		bv.Parent = root
+		flyConn = RunService.RenderStepped:Connect(function()
+			local cam = workspace.CurrentCamera
+			local move = cam.CFrame:VectorToObjectSpace(hum.MoveDirection)
+			local dir = cam.CFrame.RightVector * move.X + cam.CFrame.LookVector * -move.Z
+			local up = 0
+			if UserInputService:IsKeyDown(Enum.KeyCode.E) then up = 1 end
+			if UserInputService:IsKeyDown(Enum.KeyCode.Q) then up = -1 end
+			bv.Velocity = (dir + Vector3.new(0, up, 0)) * flySpeed
+		end)
+	else
+		hum.PlatformStand = false
+	end
+end
+
+local function applySpeed()
+	local _, _, hum = getChar()
+	if hum then hum.WalkSpeed = speedOn and walkSpeed or 16 end
+end
+
+-- Auto-farm : téléporte sur l'objet taggé "Collectible" le plus proche.
+-- À adapter avec la vraie mécanique de ton jeu.
+local function farmStep()
+	local _, root = getChar()
+	if not root then return end
+	local best, bestDist = nil, math.huge
+	for _, obj in ipairs(CollectionService:GetTagged("Collectible")) do
+		local part = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart")
+		if part then
+			local d = (part.Position - root.Position).Magnitude
+			if d < bestDist then best, bestDist = part, d end
+		end
+	end
+	if best then root.CFrame = best.CFrame + Vector3.new(0, 3, 0) end
+end
+
+local function setFarm(state)
+	farmOn = state
+	if state then
+		task.spawn(function()
+			while farmOn do
+				farmStep()
+				task.wait(0.5)
+			end
+		end)
+	end
+end
+
+-- ===== NOCLIP =====
+local noclipConn
+local function setNoclip(state)
+	if noclipConn then noclipConn:Disconnect() noclipConn = nil end
+	if state then
+		noclipConn = RunService.Stepped:Connect(function()
+			local char = player.Character
+			if not char then return end
+			for _, p in ipairs(char:GetDescendants()) do
+				if p:IsA("BasePart") then p.CanCollide = false end
+			end
+		end)
+	end
+end
+
+-- ===== AUTO-FARM MONSTRES =====
+-- Réglages à adapter à ton jeu :
+local MOB_FOLDER = nil     -- ex: "Mobs" si les monstres sont dans workspace.Mobs (nil = tout le workspace)
+local ATTACK_REMOTE = nil  -- nom exact du RemoteEvent d'attaque (nil = détection auto d'un RemoteEvent dont le nom contient "attack" ou "attaque")
+local MOB_RANGE = 500
+
+local mobFarmOn = false
+
+local function getMobs()
+	local container = MOB_FOLDER and workspace:FindFirstChild(MOB_FOLDER) or workspace
+	local list = {}
+	for _, h in ipairs(container:GetDescendants()) do
+		if h:IsA("Humanoid") and h.Health > 0 then
+			local model = h.Parent
+			local root = model:FindFirstChild("HumanoidRootPart")
+			if root and not Players:GetPlayerFromCharacter(model) then
+				table.insert(list, { model = model, hum = h, root = root })
+			end
+		end
+	end
+	return list
+end
+
+local attackRemote
+local function findAttackRemote()
+	if attackRemote and attackRemote.Parent then return attackRemote end
+	local rs = game:GetService("ReplicatedStorage")
+	if ATTACK_REMOTE then
+		attackRemote = rs:FindFirstChild(ATTACK_REMOTE, true)
+	else
+		for _, o in ipairs(rs:GetDescendants()) do
+			local n = o.Name:lower()
+			if o:IsA("RemoteEvent") and (n:find("attack") or n:find("attaque")) then
+				attackRemote = o
+				break
+			end
+		end
+	end
+	return attackRemote
+end
+
+-- Ce que fait le "clic droit" : le jeu envoie probablement l'attaque au serveur via le RemoteEvent.
+-- Si ton jeu attend des arguments (ex: la cible), modifie la ligne FireServer.
+local function attack(mob)
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+	local remote = findAttackRemote()
+	if remote then
+		remote:FireServer()
+		return
+	end
+	-- Sinon : arme équipée
+	local tool = char:FindFirstChildOfClass("Tool")
+	if not tool then
+		tool = player.Backpack:FindFirstChildOfClass("Tool")
+		if tool then hum:EquipTool(tool) end
+	end
+	if tool then tool:Activate() end
+end
+
+local function setMobFarm(state)
+	mobFarmOn = state
+	if not state then return end
+	task.spawn(function()
+		local mobs, lastScan = {}, 0
+		while mobFarmOn do
+			local _, root = getChar()
+			if root then
+				if os.clock() - lastScan > 1 then
+					mobs, lastScan = getMobs(), os.clock()
+				end
+				local best, bestDist = nil, MOB_RANGE
+				for _, m in ipairs(mobs) do
+					if m.hum.Health > 0 and m.root.Parent then
+						local d = (m.root.Position - root.Position).Magnitude
+						if d < bestDist then best, bestDist = m, d end
+					end
+				end
+				if best then
+					local target = best.root.Position
+					root.CFrame = CFrame.lookAt(target + Vector3.new(0, 0, 4), target)
+					attack(best)
+				end
+			end
+			task.wait(0.15)
+		end
+	end)
+end
+
+player.CharacterAdded:Connect(function()
+	task.wait(0.5)
+	if flyOn then setFly(true) end
+	applySpeed()
+end)
+
+-- ================= THÈME =================
+local BG = Color3.fromRGB(22, 22, 28)
+local TOP = Color3.fromRGB(30, 30, 38)
+local ROW = Color3.fromRGB(36, 36, 46)
+local OFF = Color3.fromRGB(70, 70, 84)
+local ACCENT = Color3.fromRGB(0, 146, 214)
+local TEXT = Color3.fromRGB(240, 240, 245)
+local SUB = Color3.fromRGB(150, 150, 165)
+
+local function tween(obj, props, t)
+	TweenService:Create(obj, TweenInfo.new(t or 0.18, Enum.EasingStyle.Quad), props):Play()
+end
+
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+
+local function round(obj, r)
+	new("UICorner", { CornerRadius = UDim.new(0, r or 8) }, obj)
+end
+
+-- ================= FENÊTRE =================
+local gui = new("ScreenGui", { Name = "AdminPanel", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, player:WaitForChild("PlayerGui"))
+
+local main = new("Frame", {
+	Size = UDim2.fromOffset(460, 300),
+	Position = UDim2.new(0.5, -230, 0.5, -150),
+	BackgroundColor3 = BG,
+	ClipsDescendants = true,
+}, gui)
+round(main, 12)
+new("UIStroke", { Color = Color3.fromRGB(55, 55, 70), Thickness = 1 }, main)
+
+local top = new("Frame", { Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = TOP }, main)
+new("TextLabel", {
+	Size = UDim2.new(1, -90, 1, 0),
+	Position = UDim2.fromOffset(14, 0),
+	BackgroundTransparency = 1,
+	Text = "Thanos Simulator  •  Admin",
+	TextColor3 = TEXT,
+	Font = Enum.Font.GothamBold,
+	TextSize = 15,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, top)
+
+local function topButton(text, xOffset)
+	local b = new("TextButton", {
+		Size = UDim2.fromOffset(28, 28),
+		Position = UDim2.new(1, xOffset, 0.5, -14),
+		BackgroundColor3 = ROW,
+		Text = text,
+		TextColor3 = TEXT,
+		Font = Enum.Font.GothamBold,
+		TextSize = 16,
+		AutoButtonColor = true,
+	}, top)
+	round(b, 6)
+	return b
+end
+local closeBtn = topButton("×", -36)
+local miniBtn = topButton("–", -70)
+
+local body = new("Frame", {
+	Size = UDim2.new(1, 0, 1, -40),
+	Position = UDim2.fromOffset(0, 40),
+	BackgroundTransparency = 1,
+}, main)
+
+local tabBar = new("Frame", { Size = UDim2.new(0, 110, 1, 0), BackgroundColor3 = TOP }, body)
+new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, tabBar)
+new("UIPadding", { PaddingTop = UDim.new(0, 10), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, tabBar)
+
+local pages, tabButtons = {}, {}
+
+local function selectTab(name)
+	for n, page in pairs(pages) do
+		page.Visible = (n == name)
+		tween(tabButtons[n], {
+			BackgroundColor3 = (n == name) and ACCENT or ROW,
+			TextColor3 = (n == name) and Color3.new(1, 1, 1) or SUB,
+		})
+	end
+end
+
+local function addTab(name)
+	local btn = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundColor3 = ROW,
+		Text = name,
+		TextColor3 = SUB,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 14,
+		AutoButtonColor = false,
+	}, tabBar)
+	round(btn, 8)
+	local page = new("ScrollingFrame", {
+		Size = UDim2.new(1, -126, 1, -16),
+		Position = UDim2.fromOffset(118, 8),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Visible = false,
+	}, body)
+	new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+	new("UIPadding", { PaddingRight = UDim.new(0, 6) }, page)
+	pages[name], tabButtons[name] = page, btn
+	btn.MouseButton1Click:Connect(function() selectTab(name) end)
+	return page
+end
+
+local function addToggle(page, label, callback)
+	local row = new("Frame", { Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = ROW }, page)
+	round(row)
+	new("TextLabel", {
+		Size = UDim2.new(1, -70, 1, 0),
+		Position = UDim2.fromOffset(12, 0),
+		BackgroundTransparency = 1,
+		Text = label,
+		TextColor3 = TEXT,
+		Font = Enum.Font.Gotham,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local sw = new("Frame", {
+		Size = UDim2.fromOffset(40, 20),
+		Position = UDim2.new(1, -52, 0.5, -10),
+		BackgroundColor3 = OFF,
+	}, row)
+	round(sw, 10)
+	local knob = new("Frame", {
+		Size = UDim2.fromOffset(16, 16),
+		Position = UDim2.fromOffset(2, 2),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+	}, sw)
+	round(knob, 8)
+	local hit = new("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "" }, row)
+	local on = false
+	hit.MouseButton1Click:Connect(function()
+		on = not on
+		tween(sw, { BackgroundColor3 = on and ACCENT or OFF })
+		tween(knob, { Position = UDim2.fromOffset(on and 22 or 2, 2) })
+		callback(on)
+	end)
+end
+
+local function addSlider(page, label, min, max, default, callback)
+	local row = new("Frame", { Size = UDim2.new(1, 0, 0, 56), BackgroundColor3 = ROW }, page)
+	round(row)
+	local text = new("TextLabel", {
+		Size = UDim2.new(1, -24, 0, 24),
+		Position = UDim2.fromOffset(12, 4),
+		BackgroundTransparency = 1,
+		Text = label .. " : " .. default,
+		TextColor3 = TEXT,
+		Font = Enum.Font.Gotham,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local track = new("Frame", {
+		Size = UDim2.new(1, -24, 0, 6),
+		Position = UDim2.fromOffset(12, 36),
+		BackgroundColor3 = OFF,
+	}, row)
+	round(track, 3)
+	local fill = new("Frame", {
+		Size = UDim2.fromScale((default - min) / (max - min), 1),
+		BackgroundColor3 = ACCENT,
+	}, track)
+	round(fill, 3)
+	local hit = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 24),
+		Position = UDim2.fromOffset(0, 28),
+		BackgroundTransparency = 1,
+		Text = "",
+	}, row)
+
+	local dragging = false
+	local function setFromX(x)
+		local rel = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		local v = math.floor(min + (max - min) * rel + 0.5)
+		fill.Size = UDim2.fromScale(rel, 1)
+		text.Text = label .. " : " .. v
+		callback(v)
+	end
+	hit.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(i.Position.X)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			setFromX(i.Position.X)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+end
+
+local function addButton(page, label, callback)
+	local btn = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 38),
+		BackgroundColor3 = ROW,
+		Text = label,
+		TextColor3 = TEXT,
+		Font = Enum.Font.Gotham,
+		TextSize = 14,
+	}, page)
+	round(btn)
+	btn.MouseButton1Click:Connect(callback)
+	return btn
+end
+
+local function addLabel(page, text)
+	return new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 28),
+		BackgroundTransparency = 1,
+		Text = text,
+		TextColor3 = SUB,
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, page)
+end
+
+-- ================= ONGLETS =================
+local main_page = addTab("Mouvement")
+addToggle(main_page, "Fly  (E monter / Q descendre)", setFly)
+addToggle(main_page, "Noclip", setNoclip)
+addToggle(main_page, "Vitesse", function(on)
+	speedOn = on
+	applySpeed()
+end)
+
+local farm_page = addTab("Farm")
+addToggle(farm_page, "Auto-Farm monstres", setMobFarm)
+addToggle(farm_page, "Auto-Farm objets", setFarm)
+
+local set_page = addTab("Réglages")
+addSlider(set_page, "Vitesse de vol", 20, 200, flySpeed, function(v) flySpeed = v end)
+addSlider(set_page, "Vitesse de marche", 16, 150, walkSpeed, function(v)
+	walkSpeed = v
+	if speedOn then applySpeed() end
+end)
+
+-- Onglet Zones : remplis tes zones avec { "Nom", Vector3.new(x, y, z) }
+local ZONES = {
+	{ "Spawn", Vector3.new(0, 10, 0) },
+}
+
+local tp_page = addTab("Zones")
+local posLabel = addLabel(tp_page, "Position : …")
+task.spawn(function()
+	while gui.Parent do
+		local _, root = getChar()
+		if root then
+			local p = root.Position
+			posLabel.Text = string.format("Position : %d, %d, %d",
+				math.floor(p.X + 0.5), math.floor(p.Y + 0.5), math.floor(p.Z + 0.5))
+		end
+		task.wait(0.3)
+	end
+end)
+
+local function teleportTo(pos)
+	local _, root = getChar()
+	if root then root.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0)) end
+end
+
+for _, z in ipairs(ZONES) do
+	addButton(tp_page, z[1], function() teleportTo(z[2]) end)
+end
+
+-- Sauvegarde : écris un nom, clique sur le bouton -> un bouton de téléportation apparaît
+-- et la liste à m'envoyer s'affiche dans la zone de texte en dessous.
+local nameBox = new("TextBox", {
+	Size = UDim2.new(1, 0, 0, 36),
+	BackgroundColor3 = ROW,
+	PlaceholderText = "Nom de la zone (ex: Arène)",
+	PlaceholderColor3 = SUB,
+	Text = "",
+	TextColor3 = TEXT,
+	Font = Enum.Font.Gotham,
+	TextSize = 14,
+	ClearTextOnFocus = false,
+}, tp_page)
+round(nameBox)
+
+local exportBox = new("TextBox", {
+	Size = UDim2.new(1, 0, 0, 110),
+	BackgroundColor3 = ROW,
+	Text = "",
+	PlaceholderText = "Les positions sauvegardées apparaissent ici (sélectionne et copie)",
+	PlaceholderColor3 = SUB,
+	TextColor3 = TEXT,
+	Font = Enum.Font.Code,
+	TextSize = 12,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	MultiLine = true,
+	ClearTextOnFocus = false,
+}, tp_page)
+round(exportBox)
+
+local saved = 0
+addButton(tp_page, "+ Sauvegarder ma position", function()
+	local _, root = getChar()
+	if not root then return end
+	saved += 1
+	local pos = root.Position
+	local x, y, z = math.floor(pos.X + 0.5), math.floor(pos.Y + 0.5), math.floor(pos.Z + 0.5)
+	local name = (nameBox.Text ~= "") and nameBox.Text or ("Spot " .. saved)
+	nameBox.Text = ""
+	local line = string.format('{ "%s", Vector3.new(%d, %d, %d) },', name, x, y, z)
+	exportBox.Text = exportBox.Text .. line .. "\n"
+	print(line)
+	addButton(tp_page, name, function() teleportTo(Vector3.new(x, y, z)) end)
+end)
+
+selectTab("Mouvement")
+
+-- ================= DRAG / MINIMISER / FERMER =================
+local dragging, dragStart, startPos
+top.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+		dragging, dragStart, startPos = true, i.Position, main.Position
+		i.Changed:Connect(function()
+			if i.UserInputState == Enum.UserInputState.End then dragging = false end
+		end)
+	end
+end)
+UserInputService.InputChanged:Connect(function(i)
+	if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+		local d = i.Position - dragStart
+		main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+	end
+end)
+
+local minimized = false
+miniBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	tween(main, { Size = UDim2.fromOffset(460, minimized and 40 or 300) }, 0.2)
+end)
+closeBtn.MouseButton1Click:Connect(function() main.Visible = false end)
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if not processed and input.KeyCode == Enum.KeyCode.P then
+		main.Visible = not main.Visible
+	end
+end)
