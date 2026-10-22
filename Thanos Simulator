@@ -10,7 +10,7 @@ local player = Players.LocalPlayer
 
 -- Pseudos autorisés (en minuscules)
 local ADMIN_NAMES = {
-	["kts_knigth"] = true,
+	["KTS_KNIGTH"] = true,
 	["staybusyb"] = true,
 }
 if not ADMIN_NAMES[player.Name:lower()] then return end
